@@ -3,6 +3,7 @@ import {
   Copy,
   Edit3,
   GripVertical,
+  LogIn,
   Plus,
   Save,
   ShieldAlert,
@@ -128,12 +129,115 @@ const buildCopyText = (groups: Group[]) => {
   return groupLines.join('\n')
 }
 
+const normalizeText = (value: string) => value.replace(/\s+/g, ' ').trim()
+
+const parseGroupHeaderLine = (line: string): string | null => {
+  const match = line.match(/^==\s*(.+)$/)
+  if (!match) {
+    return null
+  }
+
+  return normalizeText(match[1]) || null
+}
+
+const parseLeadLine = (line: string): { name: string; seconds: number } | null => {
+  const normalized = normalizeText(line)
+
+  if (!normalized) {
+    return null
+  }
+
+  const separatorIndex = normalized.lastIndexOf('-')
+  if (separatorIndex <= 0) {
+    return null
+  }
+
+  const rawName = normalizeText(normalized.slice(0, separatorIndex))
+  const rawTime = normalizeText(normalized.slice(separatorIndex + 1)).toLowerCase()
+
+  if (!rawName) {
+    return null
+  }
+
+  const timeMatch = rawTime.match(/^(\d+(?:[.,]\d+)?)\s*s$/)
+  if (!timeMatch) {
+    return null
+  }
+
+  const parsedSeconds = Number(timeMatch[1].replace(',', '.'))
+  if (!Number.isFinite(parsedSeconds)) {
+    return null
+  }
+
+  return {
+    name: rawName,
+    seconds: Math.max(0, parsedSeconds),
+  }
+}
+
+const parseImportedText = (raw: string): Group[] | null => {
+  const lines = raw
+    .split(/\r?\n/g)
+    .map((line) => normalizeText(line))
+    .filter(Boolean)
+
+  if (!lines.length) {
+    return null
+  }
+
+  const draftGroups: Array<{ name: string; leads: Array<{ name: string; seconds: number }> }> = []
+  let activeGroup: { name: string; leads: Array<{ name: string; seconds: number }> } | null = null
+
+  for (const line of lines) {
+    const parsedGroupName = parseGroupHeaderLine(line)
+    if (parsedGroupName) {
+      activeGroup = {
+        name: parsedGroupName || `Group ${draftGroups.length + 1}`,
+        leads: [],
+      }
+      draftGroups.push(activeGroup)
+      continue
+    }
+
+    const parsedLead = parseLeadLine(line)
+    if (!parsedLead) {
+      continue
+    }
+
+    if (!activeGroup) {
+      activeGroup = { name: 'Group 1', leads: [] }
+      draftGroups.push(activeGroup)
+    }
+
+    activeGroup.leads.push({
+      name: parsedLead.name || `Lead ${activeGroup.leads.length + 1}`,
+      seconds: parsedLead.seconds,
+    })
+  }
+
+  const groups = draftGroups
+    .filter((group) => group.leads.length > 0)
+    .map((group, groupIndex) => ({
+      id: makeId(),
+      name: group.name || `Group ${groupIndex + 1}`,
+      leads: group.leads.map((lead, leadIndex) => ({
+        id: makeId(),
+        name: lead.name || `Lead ${leadIndex + 1}`,
+        seconds: lead.seconds,
+      })),
+    }))
+
+  return groups.length ? groups : null
+}
+
 function App() {
   const [groups, setGroups] = useState<Group[]>(() => parseStoredGroups())
   const [editingGroupId, setEditingGroupId] = useState<string | null>(null)
   const [editingLeadId, setEditingLeadId] = useState<string | null>(null)
   const [dropTargetGroupId, setDropTargetGroupId] = useState<string | null>(null)
   const [copyFeedback, setCopyFeedback] = useState('')
+  const [importText, setImportText] = useState('')
+  const [isImportOpen, setIsImportOpen] = useState(false)
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(groups))
@@ -317,6 +421,23 @@ function App() {
     }
   }
 
+  const importOffsets = () => {
+    const parsed = parseImportedText(importText)
+
+    if (!parsed) {
+      setCopyFeedback('No valid entries found. Use "name- 5s" lines.')
+      return
+    }
+
+    setGroups(parsed)
+    setEditingGroupId(null)
+    setEditingLeadId(null)
+    setDropTargetGroupId(null)
+    setImportText('')
+    setIsImportOpen(false)
+    setCopyFeedback(`Imported ${parsed.length} group${parsed.length > 1 ? 's' : ''}.`)
+  }
+
   return (
     <main className="min-h-screen bg-[radial-gradient(circle_at_top,_#ecfeff_0%,_#f8fafc_45%,_#fefce8_100%)] px-3 py-3 sm:px-4">
       <div className="mx-auto flex w-full max-w-3xl flex-col gap-3 pb-6">
@@ -336,12 +457,54 @@ function App() {
                 <Copy className="h-4 w-4" />
                 Quick copy
               </Button>
+              <Button
+                variant="outline"
+                onClick={() => setIsImportOpen((active) => !active)}
+                className="h-9 gap-2 px-3"
+              >
+                <LogIn className="h-4 w-4" />
+                Import
+              </Button>
               <Button variant="secondary" onClick={addGroup} className="h-9 gap-2 px-3">
                 <Plus className="h-4 w-4" />
                 Add group
               </Button>
             </div>
           </div>
+
+          {isImportOpen && (
+            <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 p-2.5">
+              <p className="text-xs font-medium text-slate-600">
+                Paste copied list lines (supports extra spaces/new lines):
+                <span className="ml-1 font-semibold text-slate-700">name- 5s</span> and optional
+                <span className="ml-1 font-semibold text-slate-700">== Group name</span>
+              </p>
+              <textarea
+                value={importText}
+                onChange={(event) => setImportText(event.target.value)}
+                placeholder="== Group 1
+Lead 1- 0s
+Lead 2 - 5s"
+                className="mt-2 h-28 w-full resize-y rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 outline-none ring-teal-300 focus:ring-2"
+              />
+              <div className="mt-2 flex gap-2">
+                <Button onClick={importOffsets} className="h-8 gap-2 px-3 text-sm">
+                  Import now
+                </Button>
+                <Button
+                  variant="ghost"
+                  onClick={() => {
+                    setImportText('')
+                    setIsImportOpen(false)
+                  }}
+                  className="h-8 px-3 text-sm"
+                >
+                  Cancel
+                </Button>
+              </div>
+            </div>
+          )}
+
           {copyFeedback && <p className="mt-2 text-sm text-teal-700">{copyFeedback}</p>}
         </section>
 
