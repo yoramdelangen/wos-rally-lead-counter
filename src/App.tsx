@@ -455,7 +455,7 @@ function App() {
             <div className="flex flex-wrap gap-2">
               <Button onClick={copyOffsets} className="h-9 gap-2 px-3">
                 <Copy className="h-4 w-4" />
-                Quick copy
+                Copy timings
               </Button>
               <Button
                 variant="outline"
