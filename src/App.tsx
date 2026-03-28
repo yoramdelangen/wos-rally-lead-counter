@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import { compressToEncodedURIComponent, decompressFromEncodedURIComponent } from 'lz-string'
 import {
   Copy,
   Edit3,
@@ -6,6 +7,7 @@ import {
   LogIn,
   Plus,
   Save,
+  Share2,
   ShieldAlert,
   Trash2,
 } from 'lucide-react'
@@ -31,6 +33,7 @@ type DragPayload = {
 }
 
 const STORAGE_KEY = 'wos-rally-groups-v1'
+const SHARE_PARAM = 'd'
 
 const makeId = () =>
   globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`
@@ -48,6 +51,11 @@ const createGroup = (index: number): Group => ({
 })
 
 const fallbackGroup = (): Group[] => [createGroup(0)]
+
+const sanitizeName = (value: string, fallback: string) => {
+  const normalized = value.replace(/\s+/g, ' ').trim()
+  return normalized ? normalized.slice(0, 120) : fallback
+}
 
 const parseStoredGroups = (): Group[] => {
   const raw = localStorage.getItem(STORAGE_KEY)
@@ -128,6 +136,117 @@ const buildCopyText = (groups: Group[]) => {
 
   return groupLines.join('\n')
 }
+
+const encodeGroupsForShare = (groups: Group[]) => {
+  const compactPayload = groups
+    .map((group, groupIndex) => {
+      const groupName = sanitizeName(group.name, `Group ${groupIndex + 1}`)
+      const leads = group.leads
+        .map((lead, leadIndex) => {
+          const name = sanitizeName(lead.name, `Lead ${leadIndex + 1}`)
+          const seconds = Number.isFinite(lead.seconds) ? Math.max(0, lead.seconds) : 0
+          return [name, seconds] as const
+        })
+        .filter((entry) => entry[0])
+
+      return [groupName, leads] as const
+    })
+    .filter((group) => group[1].length > 0)
+
+  return compressToEncodedURIComponent(JSON.stringify(compactPayload))
+}
+
+const decodeGroupsFromShare = (encoded: string): Group[] | null => {
+  const decoded = decompressFromEncodedURIComponent(encoded)
+  if (!decoded) {
+    return null
+  }
+
+  try {
+    const parsed: unknown = JSON.parse(decoded)
+    if (!Array.isArray(parsed)) {
+      return null
+    }
+
+    const groups: Group[] = []
+
+    for (const [groupIndex, groupEntry] of parsed.entries()) {
+      if (!Array.isArray(groupEntry) || groupEntry.length < 2) {
+        continue
+      }
+
+      const rawGroupName = typeof groupEntry[0] === 'string' ? groupEntry[0] : ''
+      const groupName = sanitizeName(rawGroupName, `Group ${groupIndex + 1}`)
+      const rawLeads = Array.isArray(groupEntry[1]) ? groupEntry[1] : []
+      const leads: Lead[] = []
+
+      for (const [leadIndex, leadEntry] of rawLeads.entries()) {
+        if (!Array.isArray(leadEntry) || leadEntry.length < 2) {
+          continue
+        }
+
+        const rawLeadName = typeof leadEntry[0] === 'string' ? leadEntry[0] : ''
+        const leadName = sanitizeName(rawLeadName, `Lead ${leadIndex + 1}`)
+        const secondsValue = Number(leadEntry[1])
+
+        if (!Number.isFinite(secondsValue)) {
+          continue
+        }
+
+        leads.push({
+          id: makeId(),
+          name: leadName,
+          seconds: Math.max(0, Math.min(999999, secondsValue)),
+        })
+      }
+
+      if (!leads.length) {
+        continue
+      }
+
+      groups.push({
+        id: makeId(),
+        name: groupName,
+        leads,
+      })
+    }
+
+    return groups.length ? groups : null
+  } catch {
+    return null
+  }
+}
+
+const parseSharedGroupsFromUrl = (): Group[] | null => {
+  if (typeof window === 'undefined') {
+    return null
+  }
+
+  const params = new URLSearchParams(window.location.search)
+  const rawPayload = params.get(SHARE_PARAM)
+  if (!rawPayload) {
+    return null
+  }
+
+  return decodeGroupsFromShare(rawPayload)
+}
+
+const clearShareParamFromUrl = () => {
+  if (typeof window === 'undefined') {
+    return
+  }
+
+  const url = new URL(window.location.href)
+  if (!url.searchParams.has(SHARE_PARAM)) {
+    return
+  }
+
+  url.searchParams.delete(SHARE_PARAM)
+  const nextUrl = `${url.pathname}${url.search}${url.hash}`
+  window.history.replaceState({}, '', nextUrl)
+}
+
+const getInitialGroups = () => parseSharedGroupsFromUrl() ?? parseStoredGroups()
 
 const normalizeText = (value: string) => value.replace(/\s+/g, ' ').trim()
 
@@ -231,17 +350,22 @@ const parseImportedText = (raw: string): Group[] | null => {
 }
 
 function App() {
-  const [groups, setGroups] = useState<Group[]>(() => parseStoredGroups())
+  const [groups, setGroups] = useState<Group[]>(() => getInitialGroups())
   const [editingGroupId, setEditingGroupId] = useState<string | null>(null)
   const [editingLeadId, setEditingLeadId] = useState<string | null>(null)
   const [dropTargetGroupId, setDropTargetGroupId] = useState<string | null>(null)
   const [copyFeedback, setCopyFeedback] = useState('')
   const [importText, setImportText] = useState('')
   const [isImportOpen, setIsImportOpen] = useState(false)
+  const [showShareLink, setShowShareLink] = useState(false)
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(groups))
   }, [groups])
+
+  useEffect(() => {
+    clearShareParamFromUrl()
+  }, [])
 
   useEffect(() => {
     if (!copyFeedback) {
@@ -405,20 +529,8 @@ function App() {
       return
     }
 
-    try {
-      await navigator.clipboard.writeText(text)
-      setCopyFeedback('Copied to clipboard.')
-    } catch {
-      const helper = document.createElement('textarea')
-      helper.value = text
-      helper.style.position = 'fixed'
-      helper.style.top = '-9999px'
-      document.body.appendChild(helper)
-      helper.select()
-      document.execCommand('copy')
-      document.body.removeChild(helper)
-      setCopyFeedback('Copied to clipboard.')
-    }
+    const copied = await copyText(text)
+    setCopyFeedback(copied ? 'Copied to clipboard.' : 'Could not copy to clipboard.')
   }
 
   const importOffsets = () => {
@@ -437,6 +549,46 @@ function App() {
     setIsImportOpen(false)
     setCopyFeedback(`Imported ${parsed.length} group${parsed.length > 1 ? 's' : ''}.`)
   }
+
+  const copyText = async (value: string) => {
+    try {
+      await navigator.clipboard.writeText(value)
+      return true
+    } catch {
+      try {
+        const helper = document.createElement('textarea')
+        helper.value = value
+        helper.style.position = 'fixed'
+        helper.style.top = '-9999px'
+        document.body.appendChild(helper)
+        helper.focus()
+        helper.select()
+        const didCopy = document.execCommand('copy')
+        document.body.removeChild(helper)
+        return didCopy
+      } catch {
+        return false
+      }
+    }
+  }
+
+  const shareUrl = useMemo(() => {
+    const encoded = encodeGroupsForShare(groups)
+    if (!encoded) {
+      return ''
+    }
+
+    if (typeof window === 'undefined') {
+      return `?${SHARE_PARAM}=${encoded}`
+    }
+
+    const url = new URL(window.location.href)
+    url.searchParams.set(SHARE_PARAM, encoded)
+    url.hash = ''
+    return url.toString()
+  }, [groups])
+
+  const shareUrlTooLong = shareUrl.length > 1900
 
   return (
     <main className="min-h-screen bg-[radial-gradient(circle_at_top,_#ecfeff_0%,_#f8fafc_45%,_#fefce8_100%)] px-3 py-3 sm:px-4">
@@ -457,6 +609,28 @@ function App() {
                 <Copy className="h-4 w-4" />
                 Copy timings
               </Button>
+              <a
+                href={shareUrlTooLong || !shareUrl ? '#' : shareUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={async (event) => {
+                  event.preventDefault()
+                  setShowShareLink(true)
+
+                  if (shareUrlTooLong || !shareUrl) {
+                    setCopyFeedback('Share link is too long. Reduce groups or leads.')
+                    return
+                  }
+
+                  const copied = await copyText(shareUrl)
+                  setCopyFeedback(copied ? 'Share link copied.' : 'Could not copy share link.')
+                }}
+                className="inline-flex h-9 items-center justify-center gap-2 rounded-xl border border-slate-300 bg-white px-3 text-sm font-medium text-slate-700 transition-all hover:bg-slate-100"
+                title={shareUrl || 'No share URL available'}
+              >
+                <Share2 className="h-4 w-4" />
+                Share
+              </a>
               <Button
                 variant="outline"
                 onClick={() => setIsImportOpen((active) => !active)}
@@ -506,6 +680,11 @@ Lead 2 - 5s"
           )}
 
           {copyFeedback && <p className="mt-2 text-sm text-teal-700">{copyFeedback}</p>}
+          {showShareLink && !!shareUrl && !shareUrlTooLong && (
+            <p className="mt-1 truncate font-mono text-[11px] text-slate-500" title={shareUrl}>
+              Link: {shareUrl}
+            </p>
+          )}
         </section>
 
         <section className="flex flex-col gap-2">
